@@ -12,5 +12,5 @@ cp android/app/build/outputs/apk/debug/app-debug.apk "$OUT/PhoneTrackpad.apk"
 cp README.md "$OUT/README.md"
 
 rm -f "$OUT.zip"
-ditto -c -k --keepParent "$OUT" "$OUT.zip"   # ditto keeps the app bundle and its signature intact
+ditto -c -k --norsrc --noextattr --noqtn --keepParent "$OUT" "$OUT.zip"   # keeps the app bundle and signature, drops ._ metadata files
 echo "Packaged $PWD/$OUT.zip"
