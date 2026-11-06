@@ -3,7 +3,7 @@
 # Doesn't touch mac/build/PhoneTrackpad.app (the copy you run here).
 set -e
 cd "$(dirname "$0")"
-VERSION=1.0
+VERSION=1.1
 OUT=dist/PhoneTrackpad-$VERSION
 
 APP=$PWD/$OUT/PhoneTrackpad.app mac/build.sh

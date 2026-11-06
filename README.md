@@ -5,7 +5,7 @@ Use an Android phone as a full-screen trackpad for a Mac, with MacBook-style ges
 - `mac/`: Swift menu-bar app. Recognises gestures and posts native macOS input events.
 - `android/`: Kotlin app. A full-screen touch surface that streams raw finger positions to the Mac.
 
-The ready-to-use package (`PhoneTrackpad-1.0.zip`) contains:
+The ready-to-use package (`PhoneTrackpad-1.1.zip`) contains:
 
 | File | What it is |
 |---|---|
@@ -61,6 +61,7 @@ That's it. The sections below are optional extras.
 | While dragging, lift and touch again within 0.4 s | Keep dragging (re-grip). Tap to drop straight away |
 | Two-finger tap (both fingers together) | Right-click |
 | Slide two fingers | Scroll or pan, with glide |
+| Hold two fingers still for 0.5 s (the phone vibrates and a ←→ badge appears by the pointer), then drag right / left | Back / Forward in browsers and Finder |
 | Pinch two fingers | Zoom |
 | Three or four fingers left / right | Next / previous Space or full-screen app |
 | Three or four fingers up | Mission Control (swipe down to close) |
@@ -126,7 +127,7 @@ Needs Xcode command-line tools (`swiftc`), JDK 17+ and the Android SDK (`android
 
 ```bash
 ./mac/build.sh        # builds mac/build/PhoneTrackpad.app (Apple Silicon + Intel)
-./package.sh          # builds dist/PhoneTrackpad-1.0.zip: Mac app, APK and this README
+./package.sh          # builds dist/PhoneTrackpad-1.1.zip: Mac app, APK and this README
 ```
 
 The Mac app is ad-hoc signed, so macOS asks for the Accessibility permission again after every rebuild.

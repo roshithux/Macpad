@@ -109,14 +109,15 @@ final class EventOut {
     }
 
     func key(_ code: CGKeyCode, flags: CGEventFlags) {
-        let control = flags.contains(.maskControl)
-        if control { modifier(59, down: true, flags: [.maskControl]) }
+        let held: (code: CGKeyCode, flag: CGEventFlags)? = flags.contains(.maskControl) ? (59, .maskControl)
+            : flags.contains(.maskCommand) ? (55, .maskCommand) : nil
+        if let held { modifier(held.code, down: true, flags: held.flag) }
         for down in [true, false] {
             guard let e = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: down) else { continue }
             e.flags = flags
             e.post(tap: .cghidEventTap)
         }
-        if control { modifier(59, down: false, flags: []) }
+        if let held { modifier(held.code, down: false, flags: []) }
         // Otherwise macOS keeps Control/Fn "held" after a synthetic shortcut, and every later
         // tap arrives as a Control-click (a right click) until a real mouse click resets it.
         if let e = CGEvent(source: src) {
@@ -155,8 +156,17 @@ struct Touch { let id: Int; let p: CGPoint }   // millimetres on the phone
 
 enum SwipeAction { case left, right, up, down, pinch, spread }
 
+/// What the pointer badge should show for the two-finger Back/Forward gesture.
+enum NavFeedback {
+    case armed
+    case progress(Double)      // -1 (Back) ... 1 (Forward)
+    case fired(back: Bool)
+    case ended
+}
+
 final class GestureEngine {
     var haptic: () -> Void = {}
+    var navFeedback: (NavFeedback) -> Void = { _ in }
     private let out = EventOut()
     private let queue: DispatchQueue
 
@@ -165,6 +175,9 @@ final class GestureEngine {
     private let tapMaxTravel = 2.0
     private let tapDragWindowMs = 300.0          // tap, then touch again within this to grab
     private let dragGraceMs = 400                // a drag survives a lift this short (to re-grip)
+    private let navHoldMs = 500                  // two fingers held this long arm Back/Forward
+    private let navHoldSlop = 3.0                // moving further than this during the hold cancels it
+    private let navSwipeTravel = 10.0            // drag this far sideways after the hold to navigate
     private let pinchStartSpread = 2.0
     private let pinchScale = 50.0                // mm of finger spread per 1.0 magnification
     private let scrollStartTravel = 0.8
@@ -182,7 +195,10 @@ final class GestureEngine {
     private var baseRadius = 0.0
     private var speed = 0.0                      // smoothed finger speed, mm/s
     private var lifting = false                  // fingers are leaving a multi-finger gesture
-    private var fired = false                    // a 3/4-finger action already ran this touch
+    private var fired = false                    // a 3/4-finger or Back/Forward action already ran this touch
+    private var navHoldWork: DispatchWorkItem?
+    private var navArmed = false                 // two-finger hold finished: a sideways drag navigates
+    private var navBase = CGPoint.zero
     private var overlay: SwipeAction?            // Mission Control (.up) or App Exposé (.down) we opened
     private var tapDragArmed = false             // second touch shortly after a tap
     private var dragging = false
@@ -233,6 +249,12 @@ final class GestureEngine {
             baseRadius = radius(touches, c)
             lastT = t
             speed = 0
+            disarmNav()
+            if n == 2 && !lifting {
+                let work = DispatchWorkItem { [weak self] in self?.navHoldElapsed() }
+                navHoldWork = work
+                queue.asyncAfter(deadline: .now() + .milliseconds(navHoldMs), execute: work)
+            }
             return
         }
 
@@ -256,6 +278,7 @@ final class GestureEngine {
         stopMomentum(sendEnd: true)
         if scrolling { scrolling = false; out.scroll(dx: 0, dy: 0, phase: 4, momentum: 0) }
         if pinching { endPinch() }
+        disarmNav()
         pendingClick?.cancel()
         pendingClick = nil
         releaseWork?.cancel()
@@ -305,6 +328,7 @@ final class GestureEngine {
     }
 
     private func end(_ t: Double) {
+        disarmNav()
         let quick = t - sessionStart < tapMaxMs && travel < tapMaxTravel
         let isTap = quick && !fired && !scrolling && !dragging && !pinching
         if isTap || dragging { overlay = nil }   // a click picks a window, which closes the overlay
@@ -357,11 +381,14 @@ final class GestureEngine {
     // MARK: Two fingers: scroll with momentum, or pinch to zoom
 
     private func twoFinger(_ t: Double, _ dx: Double, _ dy: Double, _ c: CGPoint, _ touches: [Touch]) {
+        if navArmed { navigate(c); return }
         let span = radius(touches, c) * 2
-        if pinching { emitPinch(span, phase: 2); return }
-        if scrolling { emitScroll(t, dx, dy, phase: 2); return }
         let mx = c.x - baseCentroid.x, my = c.y - baseCentroid.y
         let move = hypot(mx, my), spread = abs(span - baseRadius * 2)
+        // The hold runs alongside scrolling and pinching, which never wait for it.
+        if move > navHoldSlop || spread > navHoldSlop { navHoldWork?.cancel() }
+        if pinching { emitPinch(span, phase: 2); return }
+        if scrolling { emitScroll(t, dx, dy, phase: 2); return }
         if spread > pinchStartSpread && spread > move * 1.5 {
             pinching = true
             lastSpan = baseRadius * 2
@@ -377,6 +404,41 @@ final class GestureEngine {
     private func emitPinch(_ span: Double, phase: Int64) {
         out.zoom((span - lastSpan) / pinchScale, phase: phase)
         lastSpan = span
+    }
+
+    /// Two fingers stayed put for the whole hold. Finger drift may have started a tiny scroll or
+    /// pinch, so stop that, then wait for the sideways drag.
+    private func navHoldElapsed() {
+        guard prevCount == 2, !lifting else { return }
+        if scrolling {
+            scrolling = false
+            out.scroll(dx: 0, dy: 0, phase: 4, momentum: 0)
+        }
+        if pinching { endPinch() }
+        navArmed = true
+        navBase = lastCentroid
+        haptic()
+        navFeedback(.armed)
+    }
+
+    private func disarmNav() {
+        navHoldWork?.cancel()
+        if navArmed { navFeedback(.ended) }
+        navArmed = false
+    }
+
+    private func navigate(_ c: CGPoint) {
+        guard !fired else { return }
+        let dx = c.x - navBase.x, dy = c.y - navBase.y
+        let sideways = abs(dx) > abs(dy) * 1.5
+        guard abs(dx) > navSwipeTravel, sideways else {
+            navFeedback(.progress(sideways ? -dx / navSwipeTravel : 0))
+            return
+        }
+        fired = true
+        out.key(dx > 0 ? 33 : 30, flags: [.maskCommand])   // drag right ⌘[ Back, drag left ⌘] Forward
+        haptic()
+        navFeedback(.fired(back: dx > 0))
     }
 
     private func endPinch() {
@@ -521,6 +583,7 @@ final class Server {
     let queue = DispatchQueue(label: "trackpad.engine", qos: .userInteractive)
     lazy var engine = GestureEngine(queue: queue)
     var onStatus: (String?) -> Void = { _ in }       // phone name, or nil when disconnected
+    var onNav: (NavFeedback) -> Void = { _ in }
     /// Asks the user whether a new phone may connect (main thread); reply through `answer`.
     var askToPair: (_ phone: String, _ code: String, _ answer: @escaping (Bool) -> Void) -> Void = { _, _, answer in answer(false) }
     private var listener: NWListener?
@@ -534,6 +597,7 @@ final class Server {
 
     func start() {
         engine.haptic = { [weak self] in self?.send("V") }
+        engine.navFeedback = { [weak self] f in DispatchQueue.main.async { self?.onNav(f) } }
         if udpSource == nil { startUDP() }
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
@@ -781,9 +845,21 @@ final class AdbBridge {
                     _ = Self.run(adb, ["-s", s, "shell", puts.joined(separator: "; ")])
                 } else {
                     guard let saved = d.dictionary(forKey: saveKey) as? [String: String] else { continue }
+                    // Skip devices without these settings (an emulator) or that adb can't reach.
+                    let script = self.gestureKeys.map { "settings get \($0.0) \($0.1)" }.joined(separator: "; ")
+                    func read() -> [String] {
+                        Self.run(adb, ["-s", s, "shell", script]).split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+                    }
+                    let before = read()
+                    guard before.count == self.gestureKeys.count, before.contains(where: { $0 != "null" }) else { continue }
                     let puts = self.gestureKeys.compactMap { ns, key in saved[key].map { "settings put \(ns) \(key) \($0)" } }
                     _ = Self.run(adb, ["-s", s, "shell", puts.joined(separator: "; ")])
-                    d.removeObject(forKey: saveKey)
+                    // Keep the record until the phone confirms it, so a wireless debugging drop
+                    // can't leave its gestures off for good. The retry timer tries again.
+                    let after = read()
+                    let restored = after.count == self.gestureKeys.count
+                        && self.gestureKeys.enumerated().allSatisfy { i, k in saved[k.1].map { $0 == after[i] } ?? true }
+                    if restored { d.removeObject(forKey: saveKey) }
                 }
             }
         }
@@ -810,10 +886,106 @@ final class AdbBridge {
     }
 }
 
+// MARK: - Pointer badge for Back/Forward
+
+/// A background app can't change the pointer icon, so this small panel follows the pointer instead.
+final class NavBadge {
+    private let size = NSSize(width: 84, height: 40)
+    private let panel: NSPanel
+    private let back = NSImageView()
+    private let forward = NSImageView()
+    private var follow: Timer?
+    private var finished = false
+    private var generation = 0
+
+    init() {
+        panel = NSPanel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.level = .screenSaver
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        let bg = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        bg.material = .hudWindow
+        bg.state = .active
+        bg.blendingMode = .behindWindow
+        bg.appearance = NSAppearance(named: .darkAqua)
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = size.height / 2
+        bg.layer?.masksToBounds = true
+        panel.contentView = bg
+        let config = NSImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+        for (view, symbol, name, x) in [(back, "arrow.left", "Back", 12.0), (forward, "arrow.right", "Forward", 48.0)] {
+            view.image = NSImage(systemSymbolName: symbol, accessibilityDescription: name)?.withSymbolConfiguration(config)
+            view.frame = NSRect(x: x, y: 8, width: 24, height: 24)
+            bg.addSubview(view)
+        }
+    }
+
+    func show(_ feedback: NavFeedback) {
+        switch feedback {
+        case .armed:
+            generation += 1
+            finished = false
+            highlight(0)
+            panel.alphaValue = 1
+            place()
+            panel.orderFrontRegardless()
+            follow?.invalidate()
+            follow = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.place() }
+        case .progress(let amount):
+            if !finished { highlight(amount) }
+        case .fired(let goBack):
+            finished = true
+            highlight(goBack ? -1 : 1)
+            let current = generation
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                if self?.generation == current { self?.hide() }
+            }
+        case .ended:
+            if !finished { hide() }
+        }
+    }
+
+    private func hide() {
+        follow?.invalidate()
+        follow = nil
+        generation += 1
+        let current = generation
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.15
+            panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            if self?.generation == current { self?.panel.orderOut(nil) }
+        })
+    }
+
+    /// -1 lights up Back, 1 lights up Forward, 0 shows both as ready.
+    private func highlight(_ amount: Double) {
+        let strength = min(abs(amount), 1)
+        let (active, other) = amount < 0 ? (back, forward) : (forward, back)
+        active.contentTintColor = strength > 0.1 ? .controlAccentColor : .white
+        active.alphaValue = 0.7 + 0.3 * strength
+        other.contentTintColor = .white
+        other.alphaValue = 0.7 - 0.45 * strength
+    }
+
+    /// Just below and to the right of the pointer, kept on screen.
+    private func place() {
+        let p = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(p) }?.visibleFrame ?? .zero
+        let x = min(max(p.x + 16, screen.minX), screen.maxX - size.width)
+        let y = min(max(p.y - 20 - size.height, screen.minY), screen.maxY - size.height)
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+}
+
 // MARK: - Menu bar app
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let server = Server()
+    private let navBadge = NavBadge()
     private let adb = AdbBridge()
     private var item: NSStatusItem!
     private let statusLine = NSMenuItem(title: "Waiting for phone…", action: nil, keyEquivalent: "")
@@ -859,6 +1031,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for mi in [accessItem, naturalItem, forgetItem, lagFixItem, loginItem] { mi.target = self }
         item.menu = menu
 
+        server.onNav = { [weak self] in self?.navBadge.show($0) }
         server.askToPair = { phone, code, answer in
             NSApp.activate(ignoringOtherApps: true)
             let alert = NSAlert()
@@ -889,6 +1062,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             guard let self, self.connectedName == nil else { return }
             self.adb.refresh()
+            self.adb.setPhoneGestures(paused: false)   // retries a restore that didn't get through
         }
         // Pass changes to the Mac's natural scrolling setting on to the phone's switch.
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
